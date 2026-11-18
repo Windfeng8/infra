@@ -1,0 +1,280 @@
+"""Draft generation as a program preceding target verification.
+
+[Role] Derive proposal work from a declared draft structure.
+[Invariants] Proposals are computed, verified and then committed. Draft heads
+  have their own dimensions and weights; acceptance never discounts target work.
+[Timeouts & Locks] Bounded by the scheduled proposal count and draft layers.
+[Side-Effect Policy] Constructs operator records only.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+import math
+
+from mindie_sim.catalog.draft import optional_draft_spec, draft_quant
+from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.model import LayerPlan
+from .structure import stage_map
+from .implementation_selection import resolve, LoweringRegion
+
+
+
+
+def compute_speculative_accept_step(accept_rate, draft_tokens) -> float:
+    """Expected accepted tokens in one verification step.
+
+    ``(1 - a**(d+1)) / (1 - a)`` with an exact ``a == 1`` branch.
+    """
+    if isinstance(accept_rate, bool) or not isinstance(accept_rate, (int, float)):
+        raise ModelingError("speculative_accept_rate_invalid")
+    rate = float(accept_rate)
+    if not math.isfinite(rate) or rate < 0 or rate > 1.0:
+        raise ModelingError("speculative_accept_rate_invalid")
+    if (not isinstance(draft_tokens, int) or isinstance(draft_tokens, bool)
+            or draft_tokens < 0):
+        raise ModelingError("speculative_draft_tokens_invalid")
+    if math.isclose(rate, 1.0):
+        return float(draft_tokens + 1)
+    return (1.0 - rate ** (draft_tokens + 1)) / (1.0 - rate)
+
+
+def _tag_draft_ops(ops, rows_by_request, *, step=0):
+    """Attach the actual draft producer identity and materialized row counts.
+
+    A target layer and a draft layer can share a numeric index.  Offload and
+    state consumers must use this scope, not the layer number alone, to choose
+    the producer and completion handle.
+    """
+    rows = tuple(sorted((str(request), int(count)) for request, count in rows_by_request.items()))
+    return tuple(replace(op, metadata=tuple({
+        **dict(op.metadata),
+        "layer_scope": "draft",
+        "producer_scope": "draft",
+        "draft_step": int(step),
+        "draft_rows_by_request": rows,
+    }.items())) for op in ops)
+
+
+from mindie_sim.catalog.draft_geometry import (  # noqa: F401
+    _draft_layer_plan, _reference_attention_plan, draft_layer_plans,
+)
+
+
+def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
+                  replica=0, replay_scope="none", machine=None):
+    kind = dict(runtime.metadata).get("draft_mode", "mtp")
+    draft = optional_draft_spec(model, kind)
+    from mindie_sim.catalog.paired_sfa import independent_draft
+    external_context = independent_draft(draft)
+    selected_view = lambda view: view.phase == "prefill" if prefill else bool(view.draft_proposal_tokens)
+    active = tuple(view for view in views if selected_view(view))
+    all_active = tuple(view for view in (global_views or views) if selected_view(view))
+    # Autoregressive MTP computes one proposal at a time. A parallel block
+    # drafter computes its declared query block in one transformer pass.
+    serial = not prefill and not draft.noncausal_query_block and draft.kind == "mtp"
+    steps = max(view.draft_proposal_tokens for view in all_active) if serial else 1
+    plans = draft_layer_plans(model, kind)
+    draft_model = replace(
+        model, name="draft", layers=draft.layers, hidden_size=draft.hidden_size,
+        num_heads=draft.num_heads, num_kv_heads=draft.num_kv_heads, head_dim=draft.head_dim,
+        intermediate_size=draft.intermediate_size, layer_plans=plans, auxiliary=None,
+        expert_routing=(), num_experts=draft.num_experts, top_k=draft.top_k,
+        vocab_size=draft.vocab_size or model.vocab_size,
+        quant=draft_quant(model, draft), activation_dtype=draft.activation_dtype,
+        compute_dtype=draft.activation_dtype,
+    )
+    if external_context:
+        metadata = dict(draft_model.metadata)
+        metadata.pop("cache_allocator", None)
+        metadata["cache_representations"] = {"mla_kv": {"dtype": "bf16"}}
+        metadata["attention_execution"] = {
+            **metadata.get("attention_execution", {}), "dcp_indexer_sharded": False}
+        draft_model = replace(draft_model, kv_dtype="bf16", metadata=tuple(metadata.items()))
+    regions, previous = [], ready
+    stage = runtime.parallel.pp - 1
+    # Feature projection shards its output; the draft body consumes a complete
+    # hidden vector, so TP must gather before entering the first layer.
+    tp = runtime.parallel.tp
+    for step in range(steps):
+        ops = []
+        selected = tuple(view for view in active if not serial or view.draft_proposal_tokens > step)
+
+        def proposal(view):
+            return replace(
+                view, q_len=view.q_len if prefill else 1 if serial else view.draft_proposal_tokens,
+                samples=not prefill, phase="prefill" if prefill else "decode",
+                context=view.context + (step if serial else 0),
+                draft_verify=False, draft_proposal_tokens=0,
+            )
+        proposal_views = tuple(proposal(view) for view in selected)
+        global_proposals = tuple(proposal(view) for view in all_active
+                                 if not serial or view.draft_proposal_tokens > step)
+        rows = sum(view.q_len for view in proposal_views)
+        feature_rows = (sum(view.q_len if prefill else view.draft_proposal_tokens + 1
+                            for view in selected) if external_context else rows)
+        selected_runtime, selections = resolve(
+            runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
+            global_views=global_proposals, model_scope="draft")
+        # Sequence-parallel lowering is body-scoped; draft_program manages TP
+        # feature gather explicitly before entering the draft body.
+        if "sequence_parallel" in selected_runtime.kernels:
+            selected_runtime = replace(
+                selected_runtime,
+                kernels={k: v for k, v in selected_runtime.kernels.items()
+                         if k != "sequence_parallel"})
+        requests = tuple(view.request_id for view in proposal_views)
+        prefix = "draft_prefill." if prefill else f"draft{step}."
+        feature_deps = [previous]
+        targets = stage_map(model, runtime)
+        for layer_id in draft.target_layer_ids:
+            source_stage = targets[layer_id]
+            if source_stage != stage:
+                transfer = comm_op(
+                    op_id=prefix + f"features_from{layer_id}", deps=(previous,), stage=stage,
+                    layer=-1, requests=requests, family="pp_p2p", phase="draft",
+                    recipe="draft_feature_transfer",
+                    link_bytes=feature_rows * model.hidden_size
+                    * dtype_bytes(model.activation_dtype),
+                    shape=(feature_rows, model.hidden_size),
+                    metadata=(("group_axis", "pp"), ("source_stage", source_stage),
+                              ("destination_stage", stage)))
+                ops.append(transfer)
+                feature_deps.append(transfer.op_id)
+        projection = gemm_op(
+            op_id=prefix + "features", deps=tuple(feature_deps), stage=stage, layer=-1, requests=requests,
+            m=feature_rows, n=(draft.hidden_size + tp - 1) // tp, k=draft.input_width, quant=draft_model.quant,
+            category=draft.input_projection_category, phase="draft", family="gemm",
+            recipe="draft_features",
+        )
+        if rows and draft.input_mode == "dual_normalized":
+            projected = []
+            for component in ("embedding", "target_hidden"):
+                normalized = vector_op(
+                    op_id=prefix + component + "_norm", deps=tuple(feature_deps), stage=stage,
+                    layer=-1, requests=requests, elements=rows * draft.hidden_size,
+                    ops_per_element=5, dtype=draft.activation_dtype, family="rmsnorm",
+                    phase="draft", recipe="draft_input_norm")
+                projection = gemm_op(
+                    op_id=prefix + component + "_projection", deps=(normalized.op_id,), stage=stage,
+                    layer=-1, requests=requests, m=rows, n=draft.hidden_size, k=draft.hidden_size,
+                    quant=draft_model.quant, category="linear_param_bf16", phase="draft",
+                    family="gemm", recipe="draft_feature_projection")
+                ops.extend((normalized, projection))
+                projected.append(projection.op_id)
+            projection = vector_op(
+                op_id=prefix + "features", deps=tuple(projected), stage=stage, layer=-1,
+                requests=requests, elements=rows * draft.hidden_size, ops_per_element=1,
+                dtype=draft.activation_dtype, family="elementwise", phase="draft",
+                recipe="draft_feature_add")
+            ops.append(projection)
+        elif rows:
+            ops.append(projection)
+            if tp > 1:
+                gathered = comm_op(
+                    op_id=prefix + "features_gather", deps=(projection.op_id,), stage=stage,
+                    layer=-1, requests=requests, family="allgather", phase="draft",
+                    recipe="draft_features_gather",
+                    link_bytes=feature_rows * draft.hidden_size
+                    * dtype_bytes(draft.activation_dtype) * (tp - 1) / tp,
+                    shape=(feature_rows, draft.hidden_size), metadata=(("group_axis", "tp"), ("steps", tp - 1)))
+                ops.append(gathered)
+                projection = gathered
+        global_tokens = sum(view.q_len if prefill else 1 if serial else view.draft_proposal_tokens
+                            for view in all_active if not serial or view.draft_proposal_tokens > step)
+        body_ready = projection.op_id if rows else previous
+        if external_context and rows:
+            from .draft_context import prepare
+            body_ready = prepare(
+                ops, projection=projection, model=draft_model, draft=draft,
+                rows=feature_rows, query_rows=rows, prefix=prefix,
+                stage=stage, requests=requests)
+        body, previous = frontend.body(
+            draft_model, selected_runtime, proposal_views, prefix=prefix,
+            ready=body_ready,
+            tokens=rows, mode="draft_prefill" if prefill else "draft",
+            stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
+            machine=machine,
+        )
+        ops.extend(body)
+        if prefill:
+            rows_by_request = {view.request_id: view.q_len for view in proposal_views}
+            regions.append(LoweringRegion(
+                _tag_draft_ops(ops, rows_by_request),
+                selected_runtime, draft_model.activation_dtype, rows, selections))
+            continue
+        heads, previous = frontend.logits(draft_model, selected_runtime, proposal_views, previous,
+                                         prefix=prefix, mode="draft", stage=stage, sample=False)
+        ops.extend(heads)
+        if draft.markov_rank and rows:
+            lookup = vector_op(
+                op_id=prefix + "markov_lookup", deps=(previous,), stage=stage, layer=-1,
+                requests=requests, elements=rows * draft.markov_rank, ops_per_element=1,
+                dtype=draft.activation_dtype, family="embedding", phase="draft",
+                recipe="markov_embedding")
+            markov = gemm_op(
+                op_id=prefix + "markov", deps=(lookup.op_id,), stage=stage, layer=-1, requests=requests,
+                m=rows, n=draft.vocab_size, k=draft.markov_rank, quant=draft_model.quant,
+                category="lm_head", phase="draft", family="logits", recipe="draft_markov_head",
+            )
+            correction = vector_op(
+                op_id=prefix + "markov_bias", deps=(previous, markov.op_id), stage=stage,
+                layer=-1, requests=requests, elements=rows * draft.vocab_size,
+                ops_per_element=1, dtype="fp32", family="elementwise", phase="draft",
+                recipe="markov_bias")
+            ops.extend((lookup, markov, correction))
+            previous = correction.op_id
+        if rows and (draft.confidence_executes or (runtime.dspark and runtime.dspark.confidence)):
+            confidence = vector_op(
+                op_id=prefix + "confidence", deps=(previous,), stage=stage, layer=-1, requests=requests,
+                elements=rows * (draft.hidden_size + draft.markov_rank), ops_per_element=2,
+                dtype=model.activation_dtype, family="confidence", phase="draft",
+                recipe="draft_confidence",
+            )
+            ops.append(confidence)
+            previous = confidence.op_id
+        if rows:
+            sample = vector_op(
+                op_id=prefix + "sample", deps=(previous,), stage=stage, layer=-1,
+                requests=requests, elements=rows * draft_model.vocab_size,
+                ops_per_element=5, dtype="fp32", family="sampling", phase="draft",
+                recipe="draft_sample")
+            ops.append(sample)
+            previous = sample.op_id
+        rows_by_request = {
+            view.request_id: (view.q_len if prefill else 1 if serial else view.draft_proposal_tokens)
+            for view in selected
+        }
+        regions.append(LoweringRegion(
+            _tag_draft_ops(ops, rows_by_request, step=step),
+            selected_runtime, draft_model.activation_dtype, rows, selections))
+    # Draft runs on the last pipeline stage. Send accepted proposal ids back
+    # to stage 0 so the target schedule can consume them.
+    if not prefill and runtime.parallel.pp > 1 and regions and rows > 0:
+        stage = runtime.parallel.pp - 1
+        active = [v for v in views if v.draft_proposal_tokens > 0] or list(views)
+        xfer = comm_op(
+            op_id="draft_proposal_transfer",
+            deps=(previous,),
+            stage=0,
+            layer=-1,
+            requests=tuple(v.request_id for v in active),
+            family="p2p",
+            phase="draft",
+            recipe="draft_proposal_transfer",
+            link_bytes=len(active) * max(
+                1, max((v.draft_proposal_tokens for v in active), default=1)) * 8,
+            shape=(len(active),),
+            metadata=(
+                ("group_axis", "pp"),
+                ("source_stage", stage),
+                ("destination_stage", 0),
+            ),
+        )
+        xfer = _tag_draft_ops((xfer,), {
+            view.request_id: view.draft_proposal_tokens for view in active
+        })[0]
+        last = regions[-1]
+        regions[-1] = replace(last, ops=last.ops + (xfer,))
+        previous = xfer.op_id
+    return regions, previous

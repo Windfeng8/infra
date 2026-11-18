@@ -1,0 +1,655 @@
+"""Structural resource-program defaults for device-body probes.
+
+[Role] Select resource pipelines and complete omitted helpers of the same caller.
+[Invariants] Explicit software choices win. Selection uses tensor and resource
+  geometry, never model labels or measured latency. Unsupported domains retain
+  their existing analytic program and a visible selection reason.
+[Timeouts & Locks] Bounded model metadata traversal; no I/O or locks.
+[Side-Effect Policy] Returns a new immutable case and its selection record.
+"""
+from copy import deepcopy
+from collections.abc import Mapping
+from dataclasses import replace
+from math import ceil
+
+from mindie_sim.schema.common import dtype_bytes
+
+
+_GDN_CALLER = "vllm_ascend_gdn_decode"
+
+
+ONE = 1
+
+
+def _gdn_source_options(binding):
+    if binding == _GDN_CALLER:
+        return {}
+    if isinstance(binding, dict) and binding.get("implementation") == _GDN_CALLER:
+        return binding.get("options", {})
+    return None
+
+
+def _inherit_gdn_store(binding, default=None, carried=None):
+    """Inherit one helper of the same caller; explicit empty means DMA.
+
+    Policy leaves inherit independently. Recurrence and other implementation
+    options remain whole-entry choices, not recursively merged defaults.
+    """
+    from .implementation_selection import is_policy
+
+    if is_policy(binding):
+        prior = carried if is_policy(carried) else {}
+        cases = []
+        for case in binding["cases"]:
+            previous = next((item["binding"] for item in prior.get("cases", ())
+                             if item["domain"] == case["domain"]), None)
+            cases.append({**case, "binding": _inherit_gdn_store(
+                case["binding"], default, previous)})
+        result = {**binding, "cases": cases}
+        if "otherwise" in binding:
+            result["otherwise"] = _inherit_gdn_store(
+                binding["otherwise"], default, prior.get("otherwise"))
+        return result
+    options = _gdn_source_options(binding)
+    if options is None or "gating_beta_store" in options:
+        return binding
+    prior = _gdn_source_options(carried)
+    store = prior.get("gating_beta_store", default) if prior is not None else default
+    if store is None:
+        return binding
+    declaration = {"implementation": binding} if isinstance(binding, str) else binding
+    return {**declaration, "options": {**options, "gating_beta_store": deepcopy(store)}}
+
+
+def _gdn_store_default(case, kernels):
+    """Select only the declared BF16 store helper, independently of recurrence."""
+    layers = [p for p in case.model.layer_plans if p.attention == "gdn"]
+    if (not layers or case.model.activation_dtype != "bf16"
+            or any(p.recurrent_state_dtype != "fp32" for p in layers)):
+        return None
+    declared = kernels.get("families", {}).get("gdn_gating", {})
+    outputs = declared.get("outputs", ()) if declared.get("kind") == "tiled_pointwise" else ()
+    if len(outputs) == 2 and "queue" in outputs[1]:
+        return dict(outputs[1])
+    queues = [dict(dict(d.store_queues).get("scalar_store_issue", ()))
+              for d in case.machine.dies]
+    if (queues and queues[0].get("element_bytes") == 2
+            and all(q == queues[0] for q in queues)
+            and all("scalar_store_issue" in dict(d.rates) for d in case.machine.dies)):
+        return {"bytes_per_element": 2, "resource": "scalar_store_issue", "from_hardware": True}
+    return None
+
+
+class TargetGraphSet(dict):
+    """A graph mapping plus one shared effective software declaration."""
+
+    def __init__(self, values, *, kernels, selection):
+        self.scope = "body"
+        self.effective_kernels = deepcopy(kernels)
+        self.default_selection = deepcopy(selection)
+        super().__init__((rank, TargetOperators._with_declaration(
+            ops, self.effective_kernels, self.default_selection))
+            for rank, ops in values.items())
+
+
+class TargetOperators(tuple):
+    """Tuple-compatible operator sequence with the same declaration carrier."""
+
+    def __new__(cls, values, *, kernels, selection):
+        return cls._with_declaration(values, deepcopy(kernels), deepcopy(selection))
+
+    @classmethod
+    def _with_declaration(cls, values, kernels, selection):
+        """Rank extraction shares the parent declaration without per-rank copies."""
+        result = super().__new__(cls, values)
+        result.scope = "body"
+        result.effective_kernels = kernels
+        result.default_selection = selection
+        return result
+
+    def __getitem__(self, key):
+        result = super().__getitem__(key)
+        return (self._with_declaration(result, self.effective_kernels, self.default_selection)
+                if isinstance(key, slice) else result)
+
+    def __getnewargs_ex__(self):
+        return (tuple(self),), {"kernels": self.effective_kernels,
+                               "selection": self.default_selection}
+
+
+def execution_policy(case) -> dict:
+    """Resolved execution policy stored by ``compose_case`` on the declaration."""
+    runtime = getattr(case, "runtime", None)
+    metadata = dict(getattr(runtime, "metadata", {}) or {})
+    policy = metadata.get("execution_policy")
+    return dict(policy) if isinstance(policy, Mapping) else {}
+
+
+def _strip_automatic_lowerings(case, declared):
+    """Remove lowerings that a body default installed beyond the caller's set."""
+    kernels = dict(case.runtime.kernels)
+    lowerings = kernels.get("lowerings")
+    if isinstance(lowerings, Mapping):
+        kernels["lowerings"] = {key: value for key, value in lowerings.items()
+                                if key in declared}
+    return replace(case, runtime=replace(case.runtime, kernels=kernels))
+
+
+def effective_body_declaration(case, phase, *, tokens=ONE, scope="body", enabled=True):
+    """Resolve one body declaration before either structure or timing lowers it."""
+    if scope != "body" or not enabled:
+        return case, {"profile": "explicit_declaration_preserved",
+                      "reason": "model_scope" if scope != "body" else "body_defaults_disabled"}
+    policy = execution_policy(case)
+    declared_lowerings = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
+    case, selection = attention_defaults(case, phase, tokens=tokens)
+    if not bool(policy.get("automatic_optional_fusions", True)):
+        # ``raw_eager`` (and a caller that disabled recommendations) must never
+        # re-acquire an optional fused lowering from the structural defaults.
+        case = _strip_automatic_lowerings(case, declared_lowerings)
+        selection = {**selection,
+                     "automatic_optional_fusions": "disabled_by_execution_policy",
+                     "declared_lowerings": sorted(declared_lowerings)}
+    programs = case.runtime.kernels.setdefault("programs", {})
+    explicit = "matmul" in programs
+    if not explicit:
+        # Compact the regular K recurrence on the same physical Engine.
+        # This is the lowest-priority matrix program: named/source recipes
+        # and family choices still win through RecipeBook.select.
+        # Compression must not enable the opt-in mapping search. Keep the
+        # original 128x128 output-owner grid. K64 is a capacity alternative
+        # when two FP32 K128 operand buffers do not fit a declared L0 pool.
+        programs["matmul"] = _steady_matmul_default(
+            candidates=True, a5=case.machine.sku.startswith("Ascend950"))
+        # Grouped matrices already had a mapped Steady fallback before the
+        # body default. Do not narrow their independent expert-bank domain.
+        families = case.runtime.kernels.setdefault("families", {})
+        grouped_explicit = "grouped_gemm" in families
+        if not grouped_explicit:
+            families["grouped_gemm"] = _steady_matmul_default()
+        selection["selections"].append({
+            "family": "grouped_gemm",
+            "selection": "preserved" if grouped_explicit else "default_installed",
+            "reason": "explicit_implementation_preserved" if grouped_explicit
+                      else "preserve_existing_grouped_mapping_domain",
+            "program": deepcopy(families["grouped_gemm"]),
+            "priority": "family_default; named_and_source_recipes_override",
+        })
+    selection["selections"].append({
+        "family": "matmul", "selection": "preserved" if explicit else "default_installed",
+        "reason": "explicit_implementation_preserved" if explicit
+                  else "compact_finite_k_pipeline_preserving_128_output_grid",
+        "program": deepcopy(programs["matmul"]),
+        "priority": "program_default; named_source_and_family_recipes_override",
+        "contention": "coupled_fluid_approximation_with_finite_owner_buffers",
+    })
+    return case, selection
+
+
+DEFAULT_MATMUL_CANDIDATES = (
+    (256, 256, 64),
+    (128, 256, 128),
+    (256, 128, 128),
+    (128, 256, 64),
+    (128, 128, 128),
+    (128, 128, 64),
+    (64, 256, 128),
+    (64, 128, 128),
+    (32, 128, 256),
+    (32, 128, 128),
+    (32, 64, 256),
+    (32, 32, 256),
+    (16, 128, 256),
+    (16, 64, 256),
+)
+LEGACY_MATMUL_CANDIDATES = ((128, 128, 128), (128, 128, 64))
+
+
+def _steady_matmul_default(*, candidates=False, a5=False):
+    """The compact finite-K matrix program, including symmetric owner cohorts.
+
+    Candidate tiles are declared architecture policy, not a dense-only
+    128-output narrowing. The mapping still screens L1/L0A/L0B/L0C capacity.
+    """
+    program = {"kind": "steady_matmul", "owner_cohorts": True}
+    if candidates:
+        tiles = DEFAULT_MATMUL_CANDIDATES if a5 else LEGACY_MATMUL_CANDIDATES
+        program["candidates"] = [list(item) for item in tiles]
+    return program
+
+
+def service_program_defaults(case):
+    """Install the omitted physical programs of one serving step.
+
+    A serving step declares the same operators as the body entry; only the
+    request scheduler, cache and delivery boundaries differ.  This supplies the
+    same default matrix program/family so the step lowers each declared
+    operator through the compact finite-K pipeline instead of the detailed
+    per-tile reference.  It never selects attention, scheduling, cache,
+    submission or service-regime policy, and an explicit caller declaration is
+    preserved verbatim.  The case is returned unchanged (a new runtime dict is
+    built) when an install is required, so the caller's input is not mutated.
+    """
+    kernels = case.runtime.kernels
+    if "matmul" in (kernels.get("programs") or {}):
+        return case
+    programs = {**kernels.get("programs", {}),
+                "matmul": _steady_matmul_default(
+        candidates=True, a5=case.machine.sku.startswith("Ascend950"))}
+    families = dict(kernels.get("families", {}))
+    families.setdefault("grouped_gemm", _steady_matmul_default())
+    return replace(case, runtime=replace(
+        case.runtime, kernels={**kernels, "programs": programs,
+                               "families": families}))
+
+
+def consume_target_declaration(case, target):
+    """Keep caller hardware/timing; caller kernel entries override carried defaults.
+
+    A complete recipe entry replaces the corresponding entry. The same GDN
+    caller retains its carried store helper when that field was omitted.
+    Recursively merging an envelope override into a tiled recipe would leave
+    obsolete tile fields and change the intended implementation.
+    """
+    carried = getattr(target, "effective_kernels", None)
+    if carried is None and isinstance(target, Mapping):
+        declarations = [getattr(items, "effective_kernels", None)
+                        for items in target.values()]
+        supplied = [value for value in declarations if value is not None]
+        if supplied:
+            if len(supplied) != len(declarations) or any(value != supplied[0] for value in supplied):
+                raise ValueError("body_target_kernel_declarations_differ_between_ranks")
+            carried = supplied[0]
+    if carried is None:
+        return case
+    policy = execution_policy(case)
+    automatic = bool(policy.get("automatic_optional_fusions", True))
+    declared = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
+    kernels = deepcopy(carried)
+    for key, value in case.runtime.kernels.items():
+        if key in {"recipes", "programs", "families", "lowerings"}:
+            entries = deepcopy(value)
+            if key == "lowerings":
+                if not automatic:
+                    # A raw-eager declaration never re-acquires an optional fused
+                    # lowering from a carried target declaration.
+                    kernels[key] = {name: item for name, item in
+                                    kernels.get(key, {}).items()
+                                    if name in declared}
+                if "gdn_decode" in entries:
+                    entries["gdn_decode"] = _inherit_gdn_store(
+                        entries["gdn_decode"], carried=kernels.get(key, {}).get("gdn_decode"))
+            kernels[key] = {**kernels.get(key, {}), **entries}
+        else:
+            kernels[key] = deepcopy(value)
+    return replace(case, runtime=replace(case.runtime, kernels=kernels))
+
+
+def _gqa_tiles(case, layers, tokens=1):
+    """Select finite tiles whose simultaneously live buffers fit every owner.
+
+    K and V reuse the same tile lifetime after QK, while query/online state
+    remain resident. Two window slots may each retain probabilities. This is
+    a capacity policy, not a prediction of the vendor's tiling dispatch.
+    """
+    qb, kb = dtype_bytes(case.model.activation_dtype), dtype_bytes(case.model.quant.kv_dtype)
+    tp = max(case.runtime.parallel.tp, 1)
+    cores = min((d.compute_units for d in case.machine.dies), default=0)
+    target_cores = min(cores, 20)
+    for query in (64, 32, 16, 8, 4, 2, 1):
+        for key in (128, 64, 32, 16, 8, 4, 2, 1):
+            fits = True
+            for layer in layers:
+                dim = layer.head_dim
+                sizes = {
+                    "l1": query * dim * qb + 2 * key * dim * kb,
+                    "l0a": query * dim * qb + 2 * query * key * qb,
+                    "l0b": 2 * key * dim * kb,
+                    "l0c": 2 * query * max(key, dim) * 4,
+                    "ub": query * (dim * 4 + 8) + 2 * query * key * 4,
+                }
+                for die in case.machine.dies:
+                    capacities = dict(die.buffers)
+                    if any(size * ceil(die.compute_units / die.pool_units(pool))
+                           > capacities[pool] for pool, size in sizes.items()
+                           if pool in capacities):
+                        fits = False
+                        break
+                if not fits:
+                    break
+            if fits:
+                result = {"kind": "staged_gqa_decode", "query_tile": query,
+                          "key_tile": key, "slots": 2}
+                fai_valid = (
+                    case.machine.arch_family in {"A2", "A3"}
+                    and 1 <= target_cores <= 64
+                    and 0 < tokens <= 16
+                    and key <= 512 and 512 % key == 0
+                    and all(
+                        layer.num_kv_heads >= tp
+                        and (layer.num_heads // tp) % (layer.num_kv_heads // tp) == 0
+                        and tokens * ((layer.num_heads // tp) // (layer.num_kv_heads // tp)) <= min(128, query)
+                        and min(max(1, (128 // tokens) // 2 * 2),
+                                (layer.num_heads // tp) // (layer.num_kv_heads // tp))
+                            == (layer.num_heads // tp) // (layer.num_kv_heads // tp)
+                        for layer in layers
+                    )
+                )
+                if fai_valid:
+                    result["target_cores"] = target_cores
+                    result["kv_mapping"] = "fai_host"
+                return result
+    return None
+
+
+def _gdn_default(case, phase, tokens, kernels):
+    layers = [p for p in case.model.layer_plans if p.attention == "gdn"]
+    if not layers:
+        return None
+    parallel = case.runtime.parallel
+    recipes = kernels.get("recipes", {})
+    # The analytic caller emits one named recurrence per request. Replacing
+    # that caller would remove an explicitly configured recurrent_scan0, etc.
+    per_request_scan = any(name.startswith("recurrent_scan")
+                           and name[len("recurrent_scan"):].isdigit() for name in recipes)
+    explicit = ("gdn_decode" in kernels.get("lowerings", {}) or
+                bool({"gdn_gating", "short_convolution", "recurrent_vector"}
+                     & kernels.get("families", {}).keys()) or
+                bool({"delta_gates", "short_convolution", "qk_l2norm", "recurrent_scan"}
+                     & recipes.keys()) or per_request_scan or
+                "recurrent_vector" in kernels.get("programs", {}))
+    pipes = {"hbm", "vector", "mte2_aic", "mte2_aiv", "mte3"}
+    reason = ("explicit_implementation_preserved" if explicit else
+              "partitioned_gdn_caller_domain" if phase != "decode" and parallel.pcp != 1 else
+              "decode_profile_only" if phase != "decode" else
+              "gdn_requires_bf16_inputs_fp32_state" if case.model.activation_dtype != "bf16"
+              or any(p.recurrent_state_dtype != "fp32" for p in layers) else
+              "gdn_independent_copy_pipes_not_declared" if any(
+                  not pipes <= dict(d.rates).keys() for d in case.machine.dies) else
+              "gdn_convolution_buffers_outside_declared_capacity" if any(
+                  dict(d.buffers).get("ub", 0) < 188416 for d in case.machine.dies) else "")
+    if not reason:
+        for plan in layers:
+            keys = ceil((plan.linear_key_heads or plan.linear_heads) / parallel.tp)
+            heads = ceil((plan.linear_value_heads or plan.linear_heads) / parallel.tp)
+            if (heads % keys or plan.conv_kernel not in {2, 3, 4}
+                    or tokens > 1 and plan.conv_kernel != 4):
+                reason = "gdn_head_ratio_or_convolution_outside_source_domain"
+                break
+    options = {}
+    recurrence = "analytical; no reviewed source recurrence for this hardware/domain"
+    store = "DMA resource estimate; no compatible physical store queue declared"
+    if not reason:
+        # arch35's resident-state kernel has a stricter UB/query domain than
+        # the shared caller. Keep the caller useful outside that kernel domain.
+        from .gdn_recurrent import UB_BYTES
+        native = (case.machine.arch_family == "A5" and tokens <= 8
+                  and all(dict(d.buffers).get("ub", 0) >= UB_BYTES for d in case.machine.dies)
+                  and all(1 <= (p.linear_key_head_dim or p.linear_head_dim) <= 512
+                          and 1 <= p.linear_head_dim <= 512
+                          and 1 <= ceil((p.linear_value_heads or p.linear_heads) / parallel.tp) <= 256
+                          and tokens * ceil(max(p.linear_key_head_dim or p.linear_head_dim,
+                                                p.linear_head_dim) / 16) * 16 * 4 <= 16384
+                          for p in layers))
+        if native:
+            options["recurrent_implementation"] = "arch35_fp32"
+            recurrence = "arch35_fp32; source-compatible resource program, not captured dispatch"
+        kernels.setdefault("lowerings", {})["gdn_decode"] = {
+            "implementation": "vllm_ascend_gdn_decode", "options": options}
+    lowerings = kernels.get("lowerings", {})
+    binding = lowerings.get("gdn_decode")
+    resolved = _inherit_gdn_store(
+        binding, _gdn_store_default(case, kernels) if phase == "decode" else None)
+    helper_default = resolved != binding
+    if helper_default:
+        lowerings["gdn_decode"] = resolved
+        store = "declared BF16 scalar store service and finite queue"
+    return {"family": "gdn_decode", "selection": "preserved" if reason else "default_installed",
+            "reason": reason or "supported_tensor_and_resource_geometry",
+            "caller": "non_interleaved_qkvz_ba",
+            "recurrence": "explicit_implementation_preserved" if explicit else recurrence,
+            "gating_store": ("explicit_implementation_preserved" if explicit and not helper_default
+                             else store),
+            **({"helper_defaults": ["gating_beta_store"]} if explicit and helper_default else {})}
+
+
+def _kda_default(case, phase, tokens, kernels):
+    layers = [p for p in case.model.layer_plans if p.attention == "kda"]
+    if not layers:
+        return None
+    parallel = case.runtime.parallel
+    recipes = kernels.get("recipes", {})
+    per_request_scan = any(name.startswith("recurrent_scan")
+                           and name[len("recurrent_scan"):].isdigit() for name in recipes)
+    raw_bf16 = (case.model.quant.weight_format == "bf16"
+                and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
+    # A5 Kimi K3 decode is an actual native KDA source call even when the
+    # frontend declaration is raw BF16.  Keep raw BF16 as an explicit-generic
+    # guard for non-A5 / foreign KDA domains only.
+    native_a5 = case.machine.arch_family == "A5"
+    raw_bf16_generic = raw_bf16 and not native_a5
+    explicit = ("kda" in kernels.get("lowerings", {}) or
+                bool({"short_convolution", "recurrent_vector", "recurrent_scan"}
+                     & kernels.get("families", {}).keys()) or
+                bool({"delta_gates", "short_convolution", "qk_l2norm", "recurrent_scan"}
+                     & recipes.keys()) or per_request_scan or
+                "recurrent_vector" in kernels.get("programs", {}) or
+                bool(case.runtime.tensor_layouts) or raw_bf16_generic)
+    pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
+    reason = ("explicit_implementation_preserved" if explicit else
+              "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
+              "decode_profile_only" if phase != "decode" or not 1 <= tokens <= 8 else
+              "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"
+              or any(p.recurrent_state_dtype not in {"bf16", "fp32"} for p in layers) else
+              "kda_independent_copy_pipes_not_declared" if any(
+                  not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) < 65536
+                  for d in case.machine.dies) else "")
+    if not reason:
+        for plan in layers:
+            keys = ceil((plan.linear_key_heads or plan.linear_heads) / parallel.tp)
+            heads = ceil((plan.linear_value_heads or plan.linear_heads) / parallel.tp)
+            dk = plan.linear_key_head_dim or plan.linear_head_dim
+            dv = plan.linear_head_dim
+            if (not 1 <= keys <= heads <= 256 or heads % keys != 0
+                    or dk != 128 or dv not in {128, 256}):
+                reason = "kda_head_geometry_outside_source_domain"
+                break
+    if not reason:
+        impl = ("vllm_ascend_recurrent_kda_arch35" if case.machine.arch_family == "A5"
+                else "vllm_ascend_recurrent_kda_arch22")
+        options = {}
+        if case.machine.arch_family == "A5":
+            from .kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in layers}
+            if len(bounds) != 1:
+                reason = "kda_gate_lower_bound_not_uniform_across_layers"
+            elif phase != "decode":
+                reason = "kda_source_decode_only"
+            else:
+                options = resolve_kda_source(
+                    layers[0], arch=case.machine.arch_family, phase=phase,
+                    kernels=kernels, activation_dtype=case.model.activation_dtype)
+                if options is None:
+                    reason = "kda_source_explicit_override_or_gate_invalid"
+        if not reason:
+            kernels.setdefault("lowerings", {})["kda"] = {
+                "implementation": impl, "options": options}
+    return {"family": "kda_decode", "selection": "preserved" if reason else "default_installed",
+            "reason": reason or "supported_tensor_and_resource_geometry"}
+
+
+def _attnres_default(case, phase, kernels):
+    block = next((p.residual_block_size for p in case.model.layer_plans
+                  if p.residual_block_size), 0)
+    if block < 1:
+        return None
+    # Fusing the block would delete these independently declared member
+    # programs, so an explicit residual recipe/family keeps the unfused
+    # boundary.  Generic matmul/service declarations are not residual choices.
+    from . import family_attnres
+    recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
+               "attention_residual_scores", "attention_residual_softmax",
+               "attention_residual_mix", "attention_residual_output_cast"}
+    families = {"gemm", "rmsnorm", "softmax", "elementwise", "cast"}
+    explicit = ("attention_residual" in kernels.get("lowerings", {}) or
+                bool(recipes & kernels.get("recipes", {}).keys()) or
+                bool(families & kernels.get("families", {}).keys()))
+    source_domain = (family_attnres.source_eligible(
+        case.model, case.machine.arch_family, phase)
+        and family_attnres.source_image_match(case.runtime))
+    pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
+    reason = ("explicit_implementation_preserved" if explicit else
+              "attnres_source_image_or_domain_unsupported" if not source_domain else
+              "attnres_independent_copy_pipes_not_declared" if any(
+                  not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= 32768
+                  for d in case.machine.dies) else "")
+    if not reason:
+        kernels.setdefault("lowerings", {})["attention_residual"] = "vllm_ascend_attn_res_prefix"
+    return {"family": "attention_residual", "selection": "preserved" if reason else "default_installed",
+            "reason": reason or "supported_tensor_and_resource_geometry"}
+
+
+def attention_defaults(case, phase, *, tokens=ONE):
+    kernels = deepcopy(case.runtime.kernels)
+    records = []
+    required = {"mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vector", "hbm"}
+    pipes = all(required <= dict(d.rates).keys() for d in case.machine.dies)
+    directional = all({"mte1_l0a", "mte1_l0b"} <= dict(d.service_modes).keys()
+                      for d in case.machine.dies)
+    parallel = case.runtime.parallel
+    floating = {"bf16", "fp16", "fp32", "bfloat16", "float16", "float32"}
+    quantized_kv = {"int8", "fp8", "fp8_e4m3", "fp4", "fp4_e2m1"}
+    gqa = [p for p in case.model.layer_plans if p.attention == "gqa"]
+    indexed = [p for p in case.model.layer_plans if p.attention == "mla" and p.index_topk]
+    dense_mla = [p for p in case.model.layer_plans if p.attention == "mla" and not p.index_topk
+                 and p.mla_variant == "latent_mla" and p.cache_kind == "dense"]
+    recipes, programs = kernels.setdefault("recipes", {}), kernels.setdefault("programs", {})
+    lowerings = kernels.setdefault("lowerings", {})
+    for family, layers in (("gqa_decode", gqa), ("indexed_mla", indexed)):
+        if not layers:
+            continue
+        explicit = ("attention" in kernels.get("families", {}) or
+                    (family == "gqa_decode" and ("gqa_attention" in lowerings or
+                     any(k in recipes for k in ("flash_attention", "flash_attention_decode")))) or
+                    (family == "indexed_mla" and ("indexed_attention" in lowerings or
+                     "indexed_attention" in programs)))
+        from mindie_sim.catalog.paired_sfa import execution
+        reason = ("explicit_implementation_preserved" if explicit else
+                  "gathered_head_attention_contract" if family == "indexed_mla"
+                  and execution(case.model).get("dcp_query_gather") else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != ONE else
+                  "decode_profile_only" if phase != "decode" else
+                  "independent_copy_pipes_not_declared" if not pipes else
+                  "partitioned_attention_domain" if parallel.cp != ONE else "")
+        if not reason and family == "gqa_decode":
+            if case.model.activation_dtype not in floating:
+                reason = "gqa_activation_precision_outside_fattention_domain"
+            elif (case.model.quant.kv_dtype not in floating
+                  and case.model.quant.kv_dtype not in quantized_kv):
+                reason = "gqa_kv_storage_outside_fattention_domain"
+            elif any(p.window or p.index_topk or p.noncausal_attention for p in layers):
+                reason = "windowed_noncausal_gqa_domain"
+            else:
+                tiles = _gqa_tiles(case, layers, tokens)
+                if tiles is None:
+                    reason = "gqa_resident_buffers_outside_declared_capacity"
+                else:
+                    recipes["flash_attention_decode"] = tiles
+        elif not reason:
+            max_heads = 64 if case.model.quant.kv_dtype == "int8" else 128
+            if (case.model.activation_dtype != "bf16" or case.model.quant.kv_dtype not in {"bf16", "int8"}
+                    or any(p.cache_kind != "dense" or p.window or p.noncausal_attention
+                           or (p.kv_lora_rank, p.qk_rope_head_dim) not in {(512, 64), (512, 0)}
+                           or not 1 <= p.num_heads // parallel.tp <= max_heads for p in layers)):
+                reason = "indexed_source_geometry_outside_reviewed_domain"
+            else:
+                packed = case.model.quant.kv_dtype == "int8"
+                if packed:
+                    from .indexed_quant_attention import VECTOR_BUFFER_BYTES
+                    if any(d.pool_units("ub") != d.compute_units * 2
+                           or dict(d.buffers).get("ub", 0) < VECTOR_BUFFER_BYTES
+                           or any(d.units(role) != d.compute_units * ratio for role, ratio in (
+                               ("vector", 2), ("mte2_aiv", 2), ("mte3", 2),
+                               ("mte2_aic", 1), ("mte1", 1), ("fixpipe", 1)))
+                           for d in case.machine.dies):
+                        reason = "packed_indexed_scratch_or_paired_pipe_domain"
+                if reason:
+                    records.append({"family": family, "selection": "preserved", "reason": reason})
+                    continue
+                programs["indexed_attention"] = {
+                    "kind": "indexed_attention_packed_int8" if packed else "indexed_attention_pipeline",
+                    "scratch_policy": "offchip",
+                    "operand_modes": directional,
+                }
+                if not packed and any(p.qk_rope_head_dim == 0 for p in layers):
+                    programs["indexed_attention"]["rope0_analytic"] = True
+        records.append({"family": family, "selection": "preserved" if reason else "default_installed",
+                        "reason": reason or "supported_tensor_and_resource_geometry"})
+    if dense_mla:
+        from . import paged_mla, paged_mla_arch22
+        explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
+                    or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
+        is_a5 = case.machine.arch_family == "A5"
+        valid_heads = ((lambda h: h > 0 and (1 << (h - 1).bit_length()) in {16, 32, 64})
+                       if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length()) in {8, 16}))
+        page_tile = 128 if is_a5 else 512
+        req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_arch22.BUFFERS
+        paired_pipes = all(
+            all(dict(d.buffers).get(pool, 0) >= needed for pool, needed in req_buffers.items())
+            and all(d.units(role) == d.compute_units * ratio for role, ratio in (
+                ("mte1", 1), ("mte2_aic", 1), ("fixpipe", 1),
+                ("vector", 2), ("mte2_aiv", 2), ("mte3", 2)))
+            for d in case.machine.dies
+        )
+        reason = ("explicit_implementation_preserved" if explicit else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
+                  "decode_profile_only" if phase != "decode" else
+                  "independent_copy_pipes_not_declared" if not (pipes and paired_pipes) else
+                  "partitioned_attention_domain" if parallel.cp != 1 else
+                  "paged_mla_source_geometry_outside_reviewed_domain" if (
+                      not is_a5 or tokens != 1 or case.model.activation_dtype != "bf16"
+                      or case.model.quant.kv_dtype != "bf16"
+                      or case.runtime.kv_block_size < 1 or page_tile % case.runtime.kv_block_size != 0
+                      or any(p.window or p.noncausal_attention
+                             or (p.kv_lora_rank, p.qk_rope_head_dim) != (512, 64)
+                             or not valid_heads(p.num_heads // max(parallel.tp, 1))
+                             for p in dense_mla)) else "")
+        if not reason:
+            lowerings["paged_mla_attention"] = {
+                "cases": [{
+                    "domain": {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 1},
+                               "sequences": {"min": 1, "max": 1},
+                               "max_context_tokens": {"max": 32768}},
+                    "binding": {"implementation": "ascend_paged_mla_decode_arch35",
+                                "options": {"dispatch": "source_split_core_v2"}},
+                }],
+                "otherwise": "analytical",
+            }
+        records.append({"family": "paged_mla_decode",
+                        "selection": "preserved" if reason else "default_installed",
+                        "reason": reason or "supported_tensor_and_resource_geometry"})
+    gdn = _gdn_default(case, phase, tokens, kernels)
+    if gdn is not None:
+        records.append(gdn)
+    kda = _kda_default(case, phase, tokens, kernels)
+    if kda is not None:
+        records.append(kda)
+    attnres = _attnres_default(case, phase, kernels)
+    if attnres is not None:
+        records.append(attnres)
+    model = case.model
+    if programs.get("indexed_attention", {}).get("kind") == "indexed_attention_packed_int8":
+        from mindie_sim.catalog.cache_format import with_packed_mla_cache
+        widths = {p.qk_rope_head_dim for p in indexed}
+        if len(widths) == 1:
+            model = with_packed_mla_cache(model, next(iter(widths)))
+    return replace(case, model=model, runtime=replace(case.runtime, kernels=kernels)), {
+        "profile": "decode_resource_pipelines", "selections": records,
+        "basis": "analytic resource programs; no measured dispatch or latency fit",
+        "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+        "gqa_tiles": recipes.get("flash_attention_decode"),
+        "selection_boundary": "family default; per-operator recipes retain priority",
+        "indexed_scratch": "offchip; no inferred cache hit rate",
+        "indexed_operand_service": "directional_mte1" if directional else "generic_mte1",
+        "sharedkv": "SCFA source currently requires explicit prefill declarations",
+    }

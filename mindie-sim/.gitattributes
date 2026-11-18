@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+# Evidence hashes refer to the captured bytes, independent of host line endings.
+tests/fixtures/profiler_core/** -text
+tests/fixtures/profiler_core/real_glm45/kernel_details_slice.csv -text whitespace=cr-at-eol
+
+# Published A5 collective-calibration bytes are hashed by the test.
+tests/fixtures/mindie_sim/a5-comm-rack06-calibration.json -text
+
+# Historical captures retain their original content hashes on every platform.
+data/measurements/** -text
+tests/fixtures/observations/** -text
+
+# Pinned external source and review-script hashes include original whitespace.
+data/observations/sources/** -text whitespace=-blank-at-eol,-blank-at-eof
+data/verification/native-convolution-review/review_native_conv_registers_20261028.py -text whitespace=-blank-at-eol

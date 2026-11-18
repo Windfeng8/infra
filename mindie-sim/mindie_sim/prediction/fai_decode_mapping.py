@@ -1,0 +1,125 @@
+"""FAInfer flash-decode host partitions for a staged analytical GQA body.
+
+[Role] Reproduce the small-query, paged TND FAI host's weighted KV partition.
+[Invariants] Owners consume consecutive 512-row blocks across request/head
+  boundaries. The budget resets per owner; a block's excess is not carried to
+  the next owner. KV tails and ragged lengths remain physical work. This maps
+  owners only: it does not identify a captured binary or price its device code.
+[Timeouts & Locks] O(requests * KV heads + owners); no per-KV-token expansion.
+[Side-Effect Policy] Pure arithmetic, no measurement lookup or external I/O.
+"""
+from mindie_sim.schema.common import ModelingError
+
+
+SOURCE_REVISION = "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
+SOURCE_PATH = ("attention/fused_infer_attention_score/op_host/"
+               "flash_attention_infer_tiling.h")
+HOST_KV_TILE = 512
+
+
+def uses_flash_decode(requests, kv_heads, cores):
+    """Pinned host selector for the supported paged, small-query domain."""
+    longest = max(context + q for q, context in requests)
+    tasks = len(requests) * kv_heads
+    return longest >= 1024 and (
+        (5 * tasks <= 4 * cores and longest >= cores * HOST_KV_TILE)
+        or 5 * tasks <= 2 * cores)
+
+
+def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
+    """Select flash splitting or regular round-robin query/head tasks.
+
+    The ordinary speculative q>1 branch uses FillSplitCoreTilingData and
+    flash_attention_regular.h's taskIdx = coreIdx; taskIdx += coreNum loop.
+    It has no split-KV merge. The separate q=1 high-batch specialized decoder
+    packs several KV heads in one task and is outside this ordinary branch.
+    """
+    group = query_heads // kv_heads
+    if (cores is None or not 1 <= cores <= 64 or not requests
+            or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile
+            or any(not 0 < q <= 16 or q * group > min(128, query_tile)
+                   or min(max(1, (128 // q) // 2 * 2), group) != group
+                   for q, _ in requests)):
+        raise ModelingError("fai_host_mapping_requires_supported_single_query_head_tile")
+    if uses_flash_decode(requests, kv_heads, cores):
+        return partitions(requests, query_heads, kv_heads, cores,
+                          key_tile=key_tile, query_tile=query_tile)
+    if all(q == 1 for q, _ in requests) and len(requests) >= cores:
+        # SplitCoreDecodeBS1GN2 packs up to kv_block_tile KV heads per batch task,
+        # then unpacks tail tasks into single-KV-head tasks when 0 < tail <= cores // 2.
+        kv_block_tile = min(max(1, 128 // group), kv_heads)
+        tasks_per_batch = (kv_heads + kv_block_tile - 1) // kv_block_tile
+        total_tasks = len(requests) * tasks_per_batch
+        tail_tasks = total_tasks % cores
+        rework = 0 < tail_tasks <= cores // 2 and kv_block_tile > 1
+        packed_limit = total_tasks - tail_tasks if rework else total_tasks
+        result = {}
+        task_idx = 0
+        rework_idx = packed_limit
+        for batch, (query, context) in enumerate(requests):
+            tiles = (context + query + key_tile - 1) // key_tile
+            for block_idx in range(tasks_per_batch):
+                h_start = block_idx * kv_block_tile
+                h_end = min(kv_heads, h_start + kv_block_tile)
+                if task_idx < packed_limit:
+                    owner = task_idx % cores
+                    for head in range(h_start, h_end):
+                        result[(batch, head)] = ((owner, 0, tiles),)
+                else:
+                    for head in range(h_start, h_end):
+                        result[(batch, head)] = ((rework_idx % cores, 0, tiles),)
+                        rework_idx += 1
+                task_idx += 1
+        return result
+    return {(batch, head): (((batch * kv_heads + head) % cores, 0,
+                            (context + query + key_tile - 1) // key_tile),)
+            for batch, (query, context) in enumerate(requests)
+            for head in range(kv_heads)}
+
+
+def partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
+    """Return {(request, KV head): ((owner, micro_start, micro_end), ...)}.
+
+    Requests are (query length, preceding context); host lengths include the
+    current query. The selected FAI flash-decode branch has q <= 16 and fits a
+    whole GQA query group in 128 rows. Unsupported host branches remain explicit
+    instead of silently reusing this mapping for arbitrary attention.
+    """
+    group = query_heads // kv_heads
+    lengths = tuple((q, context + q) for q, context in requests)
+    if (cores is None or not 1 <= cores <= 64 or not lengths
+            or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile):
+        raise ModelingError("fai_decode_mapping_requires_1_to_26_cores_and_512_divisor_tile")
+    if any(not 0 < q <= 16 or q * group > min(128, query_tile)
+           or min(max(1, (128 // q) // 2 * 2), group) != group
+           for q, _ in lengths):
+        raise ModelingError("fai_decode_mapping_requires_one_query_head_group_tile")
+    if not uses_flash_decode(requests, kv_heads, cores):
+        raise ModelingError("fai_decode_mapping_outside_flash_decode_host_domain")
+
+    total = sum(q * k for q, k in lengths) * query_heads
+    budget = (total + cores - 1) // cores
+    owner, remaining = 0, budget
+    micro_per_host = HOST_KV_TILE // key_tile
+    result = {}
+    for request, (query, length) in enumerate(lengths):
+        host_tiles = (length + HOST_KV_TILE - 1) // HOST_KV_TILE
+        row_work = query * group
+        for head in range(kv_heads):
+            ranges, start = [], 0
+            while start < host_tiles:
+                full_tile_work = row_work * HOST_KV_TILE
+                count = min(host_tiles - start,
+                            (remaining + full_tile_work - 1) // full_tile_work)
+                end = start + count
+                ranges.append((owner, start * micro_per_host,
+                               min(end * micro_per_host,
+                                   (length + key_tile - 1) // key_tile)))
+                remaining -= row_work * (min(end * HOST_KV_TILE, length)
+                                         - start * HOST_KV_TILE)
+                start = end
+                if remaining <= 0:
+                    owner += 1
+                    remaining = budget
+            result[request, head] = tuple(ranges)
+    return result

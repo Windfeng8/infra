@@ -1,0 +1,178 @@
+{
+  "name": "qwen35-35b-a3-tp4-longctx-decode-126000-3000",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 4,
+    "ranks_per_node": 16
+  },
+  "model": {
+    "catalog_key": "qwen3.5-35b-a3b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.qkvz": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.beta_alpha": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.o": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "shared_expert": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        }
+      },
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/Qwen3.5-35B-A3B-w8a8-mtp_high_conc_decode_tpot30_c144_20261030",
+      "client_concurrency": 144,
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentGatedDeltaRule",
+          "tensor_batch_slots": 160,
+          "query_rows_per_slot": 4,
+          "tensor_query_rows": 640,
+          "first_csv_row": 162,
+          "sample_count": 97,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "longctx_decode_scenario": {
+        "source": {
+          "path": "repository://profiler/examples/structure/cases/decode-qwen35-35b-a3-tp4-c144.json",
+          "sha256": "489943fc3eca59c0da4b00f90d9fa0144108c947d5cf5c79ae547feeaffbceac",
+          "size_bytes": 3145
+        },
+        "prompt_tokens": 126000,
+        "output_tokens": 3000,
+        "snapshot_contexts": [
+          126000,
+          127500,
+          128999
+        ],
+        "global_concurrency": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64
+        ],
+        "distribution": "explicit balanced global concurrency across preserved DP replicas",
+        "query_tokens_per_sequence": 1,
+        "boundary": "complete target model body, one Decode query per active sequence",
+        "not_executed": [
+          "Prefill",
+          "output head",
+          "sampling",
+          "draft model",
+          "host scheduler",
+          "client transport"
+        ],
+        "accuracy": "prediction scenario; no same-boundary long-context measurement bound",
+        "parameters": "existing source-case physical services unchanged; no new fit",
+        "source_domain_changes": [
+          {
+            "selector": "model.quant.category_overrides.shared_expert",
+            "previous": "int8 preset inheritance",
+            "selected": "bf16 activation and weight",
+            "reason": "retained MatMulV2 operands at low rows33934/33936 and high rows182/184",
+            "parameter_changes": "representation correction; no service/rate change"
+          },
+          {
+            "selector": "runtime.moe_recipe",
+            "previous": "alltoall",
+            "selected": "tp_join_reduce",
+            "reason": "retained FFN sum follows routed unpermute and shared join at low row33942 and high row189",
+            "parameter_changes": "reduction boundary and payload correction; no service/rate change"
+          }
+        ]
+      },
+      "ffn_source_contract": {
+        "evidence": {
+          "path": "tests/fixtures/verification/qwen35-a3-ffn-contract.json",
+          "sha256": "c42b158e6f7bda51edd3fe607355a1a37633e920c35fd1be51cb75ebfb579f1a"
+        },
+        "shared_precision": "BF16 activation and weight in both low and high row captures",
+        "reduction_boundary": "one TP sum after routed unpermute and shared gated join",
+        "grouped_execution": "analytical decomposition; retained arch22 fusion is not modeled or replaced by arch35"
+      }
+    },
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 129000,
+    "max_num_seqs": 64,
+    "moe_recipe": "tp_join_reduce"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 126000,
+        "output_tokens": 3000
+      }
+    ]
+  }
+}

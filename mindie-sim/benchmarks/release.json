@@ -1,0 +1,46 @@
+{
+  "schema_version": "mindie-release-suite/1",
+  "suite": "core",
+  "publishable": true,
+  "cases": [
+    {
+      "id": "causal-pipeline",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 3,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "pipeline"
+      ]
+    },
+    {
+      "id": "causal-serving",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 3,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "serving"
+      ]
+    },
+    {
+      "id": "causal-pd-serving",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 3,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "pd-serving"
+      ]
+    }
+  ]
+}
